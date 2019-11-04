@@ -1,10 +1,14 @@
-import ESMF as _ESMF
+#import ESMF as _ESMF
 import numpy as _np
 import pandas as pd
 import uuid as _uuid
 import dask.array as _dsa
+from dask.base import tokenize
+import pyresample as _pyresample
 
 import xarray as _xr
+
+#_ESMF.Manager(debug=True)
 
 class projection():
 
@@ -48,20 +52,30 @@ class projection():
 
         ny, nx = lon_src.shape
 
-        # construct the ESMF grid object
-        self.model_grid = _ESMF.Grid(_np.array([nx, ny]))
-        self.model_grid.add_coords(staggerloc=[_ESMF.StaggerLoc.CENTER])
-        self.model_grid.coords[_ESMF.StaggerLoc.CENTER]
-        self.model_grid.coords[_ESMF.StaggerLoc.CENTER][0][:] = lon_src.T
-        self.model_grid.coords[_ESMF.StaggerLoc.CENTER][1][:] = lat_src.T
-        self.model_grid.is_sphere = from_global
-
-        # import obs location into ESMF locstream object
         self.nobs = len(lon_obs)
-        self.locstream_obs = _ESMF.LocStream(self.nobs,
-                                             coord_sys=_ESMF.CoordSys.SPH_DEG)
-        self.locstream_obs["ESMF:Lon"] = lon_obs[:]
-        self.locstream_obs["ESMF:Lat"] = lat_obs[:]
+
+#### ESMF block commented out: I hope one day to be able to make it work
+#### as of right now, ESMF doesn't play nice with dask so I replaced by
+#### pyresample
+#        # construct the ESMF grid object
+#        self.model_grid = _ESMF.Grid(_np.array([nx, ny]))
+#        self.model_grid.add_coords(staggerloc=[_ESMF.StaggerLoc.CENTER])
+#        self.model_grid.coords[_ESMF.StaggerLoc.CENTER]
+#        self.model_grid.coords[_ESMF.StaggerLoc.CENTER][0][:] = lon_src.T
+#        self.model_grid.coords[_ESMF.StaggerLoc.CENTER][1][:] = lat_src.T
+#        self.model_grid.is_sphere = from_global
+#
+#        # import obs location into ESMF locstream object
+#        self.locstream_obs = _ESMF.LocStream(self.nobs,
+#                                             coord_sys=_ESMF.CoordSys.SPH_DEG)
+#        self.locstream_obs["ESMF:Lon"] = lon_obs[:]
+#        self.locstream_obs["ESMF:Lat"] = lat_obs[:]
+
+        self.model_grid = _pyresample.geometry.GridDefinition(lons=lon_src,
+                                                              lats=lat_src)
+
+        self.locstream_obs = _pyresample.geometry.SwathDefinition(lons=lon_obs,
+                                                                  lats=lat_obs)
 
         return None
 
@@ -82,16 +96,16 @@ class projection():
         # It seems that setting the masked points to np.nan does the
         # work at lower cost
 
-        # create field object for model data
-        field_model = _ESMF.Field(self.model_grid,
-                                  staggerloc=_ESMF.StaggerLoc.CENTER)
-        # create field object for observation locations
-        field_obs = _ESMF.Field(self.locstream_obs)
-
-        interpol = _ESMF.Regrid(field_model, field_obs,
-                                regrid_method=_ESMF.RegridMethod.BILINEAR,
-                                unmapped_action=_ESMF.UnmappedAction.IGNORE)
-
+#        # create field object for model data
+#        field_model = _ESMF.Field(self.model_grid,
+#                                  staggerloc=_ESMF.StaggerLoc.CENTER)
+#        # create field object for observation locations
+#        field_obs = _ESMF.Field(self.locstream_obs)
+#
+#        interpol = _ESMF.Regrid(field_model, field_obs,
+#                                regrid_method=_ESMF.RegridMethod.BILINEAR,
+#                                unmapped_action=_ESMF.UnmappedAction.IGNORE)
+#
         # check for input data shape
         if timedim not in data.dims:
             data = data.expand_dims(dim=timedim)
@@ -106,54 +120,71 @@ class projection():
 
         def compute_chunk(lev, rec, mem):
             data2d = data.isel({memberdim: mem, timedim: rec, zdim: lev}).values
-            #print(data2d)
-            return self.interp_chunk(data2d, interpol, mask_value)[None, None]
+            return self.interp_chunk(data2d, self.model_grid, 
+                                     self.locstream_obs,
+                                     mask_value)
 
-# this should work but crashes weirdly
-#        dsk = {(data.name, mem, rec, lev, 0): (compute_chunk, lev, rec, mem)
-#            for lev in range(nlev)
-#            for rec in range(nrec)
-#            for mem in range(nmem)}
-#
-#        out = _dsa.Array(dsk, data.name, chunks,
-#                         dtype=_np.dtype('float'), shape=shape)
+        def compute_chunks():
+            for lev in range(nlev):
+                for rec in range(nrec):
+                    for mem in range(nmem):
+                        return compute_chunk(lev, rec, mem)
 
-        # try a dirty loop
-        npout = _np.empty(shape)
-        for mem in range(nmem):
-            for rec in range(nrec):
-                for lev in range(nlev):
-                    npout[mem, rec, lev,:] = compute_chunk(lev, rec, mem)
+        name = str(data.name) + '-' + tokenize(data.name, shape)
+        dsk = {(name, mem, rec, lev, 0,): (compute_chunk, lev, rec, mem,)
+            for lev in range(nlev)
+            for rec in range(nrec)
+            for mem in range(nmem)}
 
-        field_model.destroy()
-        field_obs.destroy()
-        interpol.destroy()
+        out = _dsa.Array(dsk, name, chunks,
+                         dtype=_np.dtype('float'), shape=shape)
+
+        out.compute()
+
+        ### ESMF stuff
+        #field_model.destroy()
+        #field_obs.destroy()
+        #interpol.destroy()
 
         # need to add coords
-        #xout = _xr.DataArray(data=out, dims=(memberdim, timedim, zdim, 'station'))
-        xout = _xr.DataArray(data=npout, dims=(memberdim, timedim, zdim, 'station'))
+        xout = _xr.DataArray(data=out, dims=(memberdim, timedim, zdim, 'station'))
+
         if outtype == 'ndarray':
             return xout.values
         elif outtype == 'xarray':
             return xout
 
-    def interp_chunk(self, data2d, interpol, mask_value):
+    def interp_chunk(self, data2d, model_grid, locstream_obs, mask_value):
  
-        # create field object for model data
-        field_model_local = _ESMF.Field(self.model_grid,
-                                        staggerloc=_ESMF.StaggerLoc.CENTER)
-        # create field object for observation locations
-        field_obs_local = _ESMF.Field(self.locstream_obs)
         # this is the eager part
-        data2d = data2d.transpose() # needed for ESMPy, could be done more elegantly
         if mask_value is not None:
             # ugly fix, cf note above
             data2d[_np.where(data2d == mask_value)] = _np.nan
+
+        ### ESMF may be able to handle local interpolators and fields in the future?
+        #local_interpol = interpol.copy()
+        #local_model_grid = model_grid.copy()
+        # create field object for model data
+        #field_model_local = _ESMF.Field(model_grid,
+        #                                staggerloc=_ESMF.StaggerLoc.CENTER)
+        # create field object for observation locations
+        #field_obs_local = _ESMF.Field(locstream_obs)
+
+        #data2d = data2d.transpose() # needed for ESMPy, could be done more elegantly
         # feed it to ESMPy structure
-        field_model_local.data[:] = data2d
+        #field_model_local.data[:] = data2d
         # run the interpolator
-        field_obs_local = interpol(field_model_local, field_obs_local)
-        data_model_interp = field_obs_local.data.copy()
-        field_model_local.destroy()
-        field_obs_local.destroy()
+        #field_obs_local = local_interpol(field_model_local, field_obs_local)
+        #data_model_interp = field_obs_local.data.copy()
+
+        #field_model_local.destroy()
+        #field_obs_local.destroy()
+        #local_interpol.destroy()
+
+        # replaced by pyresample
+        data_model_interp = _pyresample.kd_tree.resample_nearest(model_grid, 
+                                                                 data2d.ravel(),
+                                                                 locstream_obs,
+                                                                 200000)
+        data_model_interp = _np.reshape(data_model_interp, (1,1,1,self.nobs))
         return data_model_interp

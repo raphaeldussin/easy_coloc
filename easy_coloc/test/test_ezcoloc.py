@@ -25,9 +25,11 @@ def test_ar07w(datafiles, out):
                                      grid=ds)
     fld = proj.run(ds['t_an'], outtype=out)
     if out == 'ndarray':
-        print(fld)
         assert isinstance(fld, np.ndarray)
         assert fld.shape == (1, 1, 102, 30)
     elif out == 'xarray':
         assert isinstance(fld, xr.core.dataarray.DataArray)
+        assert fld.shape == (1, 1, 102, 30)
+        assert isinstance(fld.values, np.ndarray)
+
     return None
